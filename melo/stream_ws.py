@@ -32,8 +32,46 @@ class Event:
 
 MAX_CONCURRENCY = 100
 _tts_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-_tts_model = TTS(language="ZH")
-_speaker_ids = _tts_model.hps.data.spk2id
+_model_lock = asyncio.Lock()
+_tts_model = None
+_speaker_ids: Dict[str, int] = {}
+_active_connections = 0
+
+
+async def _get_tts_model() -> None:
+    """Lazy-load the TTS model and count active connections."""
+    global _tts_model, _speaker_ids, _active_connections
+    async with _model_lock:
+        if _tts_model is None:
+            _tts_model = TTS(language="ZH")
+            _speaker_ids = _tts_model.hps.data.spk2id
+        _active_connections += 1
+
+
+async def _release_tts_model() -> None:
+    """Decrease active connection count and free model resources if unused."""
+    global _tts_model, _speaker_ids, _active_connections
+    model = None
+    async with _model_lock:
+        _active_connections -= 1
+        if _active_connections == 0 and _tts_model is not None:
+            model = _tts_model
+            _tts_model = None
+            _speaker_ids = {}
+    if model is not None:
+        try:
+            if hasattr(model, "model"):
+                model.model.cpu()
+        except Exception:
+            pass
+        del model
+        try:
+            import torch, gc
+
+            torch.cuda.empty_cache()
+            gc.collect()
+        except Exception:
+            pass
 
 
 def pack_frame(msg_type: int, event_type: int, payload: Dict, audio_data: bytes = b"") -> bytes:
@@ -76,6 +114,7 @@ async def synthesize(text: str, speaker_id: int) -> bytes:
 
 
 async def handle_connection(ws: WebSocketServerProtocol):
+    await _get_tts_model()
     session_id = str(uuid.uuid4())
     speaker_id = None
     try:
@@ -164,6 +203,7 @@ async def handle_connection(ws: WebSocketServerProtocol):
             await ws.wait_closed()
         except Exception:
             pass
+        await _release_tts_model()
 
 
 async def main(host: str = "0.0.0.0", port: int = 8010):
